@@ -1,0 +1,134 @@
+- name: Instalar docker swarm e portainer
+  hosts: distros
+  become: yes
+  tasks:
+    - name: Atualizar pacotes
+      apt:
+        update_cache: yes
+        upgrade: yes
+
+    # - name: Baixar script de instalação do Docker
+    #   get_url:
+    #     url: "https://get.docker.com"
+    #     dest: "/tmp/get-docker.sh"
+
+    # - name: Executar script de instalação do Docker
+    #   command: "sh /tmp/get-docker.sh"
+    
+    # - name: Iniciar o Swarm
+    #   command: "docker swarm init"
+    #   ignore_errors: true
+
+    - name: Criar rede overlay 'agent_network'
+      command: "docker network create --driver=overlay agent_network"
+      ignore_errors: true
+
+    - name: Criar rede overlay 'traefik_public'
+      command: "docker network create --driver=overlay traefik_public"
+      ignore_errors: true
+
+    - name: Criar stack do traefik
+      copy:
+        content: |
+          version: '3.9'
+          # mais info: https://youtu.be/o7tBbYy-5I4
+          services:
+            traefik:
+              image: traefik:latest
+              command:
+                - --providers.docker=true
+                - --entrypoints.web.address=:80
+                - --entrypoints.websecure.address=:443
+                - --providers.docker.exposedbydefault=false
+                - --providers.docker.swarmMode=true
+                - --providers.docker.network=traefik_public
+                - --providers.docker.endpoint=unix:///var/run/docker.sock
+                - --certificatesresolvers.le.acme.httpchallenge.entrypoint=web
+                - --certificatesresolvers.le.acme.email=diegoalencar.jacober@gmail.com
+                - --certificatesresolvers.le.acme.storage=/letsencrypt/acme.json
+                - --certificatesresolvers.le.acme.tlschallenge=true
+              ports:
+                - "80:80"
+                - "443:443"
+              volumes:
+                - traefik_certificates:/letsencrypt
+                - "/var/run/docker.sock:/var/run/docker.sock:ro"
+              deploy:
+                mode: replicated
+                replicas: 1
+                placement:
+                  constraints:
+                    - node.role == manager
+              networks:
+                - traefik_public
+          volumes:
+            traefik_certificates:
+              external: true
+          networks:
+            traefik_public:
+              external: true
+        dest: "~/traefik.yml"
+      ignore_errors: true
+
+      
+    - name: Executar stack
+      command: "docker stack deploy -c ~/traefik.yml traefik"
+
+    - name: Criar arquivo de configuração do Portainer
+      copy:
+        content: |
+          version: "3.9"
+
+          services:
+            agent:
+              image: portainer/agent:latest
+              volumes:
+                - /var/run/docker.sock:/var/run/docker.sock
+                - /var/lib/docker/volumes:/var/lib/docker/volumes
+              networks:
+                - agent_network
+              deploy:
+                mode: global
+                placement:
+                  constraints: [ node.platform.os == linux ]
+
+            portainer:
+              image: portainer/portainer-ce:latest
+              command: -H tcp://tasks.agent:9001 --tlsskipverify
+              ports:
+                - 9000:9000
+              volumes:
+                - portainer_data:/data
+              networks:
+                - agent_network
+                - traefik_public
+              deploy:
+                mode: replicated
+                replicas: 1
+                placement:
+                  constraints: [ node.role == manager ]
+                labels:
+                  - "traefik.enable=true"
+                  - "traefik.docker.network=traefik_public"
+                  - "traefik.http.routers.portainer.rule=Host(`portainer.diegojacober.online`)"
+                  - "traefik.http.routers.portainer.entrypoints=websecure"
+                  - "traefik.http.routers.portainer.priority=1"
+                  - "traefik.http.routers.portainer.tls.certresolver=le"
+                  - "traefik.http.routers.portainer.service=portainer"
+                  - "traefik.http.services.portainer.loadbalancer.server.port=9000"
+
+          networks:
+            traefik_public:
+              external: true
+              attachable: true
+            agent_network:
+              external: true
+
+          volumes:
+            portainer_data:
+              external: true
+        dest: "~/portainer.yml"
+      
+
+    - name: Executar stack Portainer
+      command: "docker stack deploy -c ~/portainer.yml portainer"
